@@ -11,3 +11,8 @@ status = 200
 from = "/whs-inventory/v1"
 to = "/.netlify/functions/whs-inventory"
 status = 200
+
+[[redirects]]
+from = "/v1/catalog/warehouse"
+to = "/.netlify/functions/catalog-warehouse"
+status = 200
