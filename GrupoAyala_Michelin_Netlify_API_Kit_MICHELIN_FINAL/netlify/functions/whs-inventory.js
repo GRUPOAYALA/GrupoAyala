@@ -1,20 +1,60 @@
+const {
+  json,
+  validateHeaders,
+  buildIssueTimestamp,
+  buildDocumentNumber
+} = require("./_lib/auth");
+
 function detectDelimiter(headerLine) {
   const comma = headerLine.split(",").length;
   const semi = headerLine.split(";").length;
   return semi > comma ? ";" : ",";
 }
 
-function normalizeHeader(h) {
-  return (h || "")
-    .toString()
+function normalizeHeader(value) {
+  return String(value || "")
     .trim()
     .toUpperCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
 }
 
-function pickDescriptionIndex(headersNorm) {
-  const candidates = [
+function pickIndex(headers, candidates) {
+  for (const candidate of candidates) {
+    const idx = headers.indexOf(candidate);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function toInt(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/,/g, ".");
+  const num = Number.parseFloat(normalized);
+  return Number.isFinite(num) ? Math.round(num) : 0;
+}
+
+function parseCsv(text) {
+  const lines = String(text || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .filter((line) => line.trim() !== "");
+
+  if (lines.length < 2) {
+    return [];
+  }
+
+  const delimiter = detectDelimiter(lines[0]);
+  const headersRaw = lines[0].split(delimiter);
+  const headers = headersRaw.map(normalizeHeader);
+
+  const idxWarehouse = pickIndex(headers, ["ALMACEN", "WAREHOUSE", "WHS"]);
+  const idxShipTo = pickIndex(headers, ["SHIPTO", "SHIP_TO", "SHIP TO", "CONSIGNATARIO"]);
+  const idxMspn = pickIndex(headers, ["ARTICULO", "MSPN", "SKU", "PRODUCTO"]);
+  const idxAvailable = pickIndex(headers, ["DISPONIBLE", "AVAILABLE", "EXISTENCIA"]);
+  const idxDescription = pickIndex(headers, [
     "DESCRIPCION",
     "DESCRIPCIONARTICULO",
     "DESCRIPCION_ARTICULO",
@@ -26,148 +66,129 @@ function pickDescriptionIndex(headersNorm) {
     "DESCR",
     "DESCRIP",
     "DESC"
-  ];
-  for (const c of candidates) {
-    const idx = headersNorm.indexOf(c);
-    if (idx !== -1) return idx;
-  }
-  return -1;
-}
+  ]);
+  const idxEan = pickIndex(headers, ["EANUCC", "EAN", "CODIGOBARRAS", "CODIGO_BARRAS"]);
 
-function parseCsv(text) {
-  const lines = text.replace(/\r/g, "").split("\n").filter(l => l.trim() !== "");
-  if (lines.length < 2) return [];
-
-  const delimiter = detectDelimiter(lines[0]);
-  const headersRaw = lines[0].split(delimiter);
-  const headersNorm = headersRaw.map(normalizeHeader);
-
-  const idxWhs = headersNorm.indexOf("ALMACEN");
-  const idxShip = headersNorm.indexOf("SHIPTO");
-  const idxMspn = headersNorm.indexOf("ARTICULO");
-  const idxAvail = headersNorm.indexOf("DISPONIBLE");
-  const idxDesc = pickDescriptionIndex(headersNorm);
-
-  if (idxWhs === -1 || idxMspn === -1 || idxAvail === -1) {
-    throw new Error("CSV debe contener columnas: ALMACEN, ARTICULO, DISPONIBLE (SHIPTO opcional).");
+  if (idxWarehouse === -1 || idxMspn === -1 || idxAvailable === -1) {
+    throw new Error("CSV must contain warehouse, mspn and available columns.");
   }
 
-  const out = [];
-  for (let i = 1; i < lines.length; i++) {
-    const row = lines[i].split(delimiter);
-    const warehouse = String(row[idxWhs] ?? "").trim();
-    const shipTo = idxShip !== -1 ? String(row[idxShip] ?? "").trim() : "";
-    const mspn = String(row[idxMspn] ?? "").trim();
-
-    let availRaw = String(row[idxAvail] ?? "").trim().replace(/,/g, ".");
-    let available = parseFloat(availRaw);
-    if (Number.isNaN(available)) available = 0;
-
-    const desc = idxDesc !== -1 ? String(row[idxDesc] ?? "").trim() : "";
+  const rows = [];
+  for (let i = 1; i < lines.length; i += 1) {
+    const parts = lines[i].split(delimiter);
+    const warehouse = String(parts[idxWarehouse] ?? "").trim();
+    const mspn = String(parts[idxMspn] ?? "").trim();
     if (!warehouse || !mspn) continue;
 
-    out.push({
+    rows.push({
       warehouse,
-      shipTo,
+      shipTo: idxShipTo !== -1 ? String(parts[idxShipTo] ?? "").trim() : "",
       mspn,
-      description: desc,
-      available: Math.round(available)
+      description:
+        idxDescription !== -1 ? String(parts[idxDescription] ?? "").trim() : String(mspn),
+      eanucc: idxEan !== -1 ? String(parts[idxEan] ?? "").trim() : "",
+      available: toInt(parts[idxAvailable])
     });
   }
-  return out;
+
+  return rows;
 }
 
-function json(statusCode, obj) {
+async function fetchInventoryCsv(event) {
+  const proto = event.headers?.["x-forwarded-proto"] || "https";
+  const host = event.headers?.host;
+  if (!host) throw new Error("Missing host header.");
+  const url = `${proto}://${host}/inventarios.csv?ts=${Date.now()}`;
+  const response = await fetch(url, {
+    headers: { "cache-control": "no-store" }
+  });
+  if (!response.ok) {
+    throw new Error(`Inventory CSV request failed with status ${response.status}.`);
+  }
+  return parseCsv(await response.text());
+}
+
+function buildBaseResponse() {
   return {
-    statusCode,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      "access-control-allow-origin": "*",
-      "access-control-allow-methods": "GET,OPTIONS",
-      "access-control-allow-headers": "content-type,authorization,apikey,client-id"
-    },
-    body: JSON.stringify(obj, null, 2)
+    ...buildIssueTimestamp(),
+    documentID: "",
+    documentNumber: buildDocumentNumber(),
+    variant: 0
   };
 }
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") return json(204, { ok: true });
+  if (event.httpMethod === "OPTIONS") {
+    return json(204, { ok: true });
+  }
+
+  if (event.httpMethod !== "GET") {
+    return json(405, { error: "method_not_allowed", message: "Only GET is allowed." });
+  }
+
+  const auth = validateHeaders(event);
+  if (!auth.ok) return auth.response;
 
   try {
-    const warehouse = (event.queryStringParameters?.warehouse || "").trim();
-    const mspn = (event.queryStringParameters?.mspn || "").trim();
+    const warehouse = String(event.queryStringParameters?.warehouse || "").trim();
+    const mspn = String(event.queryStringParameters?.mspn || "").trim();
 
-    const origin =
-      event.headers["x-forwarded-proto"] && event.headers["host"]
-        ? `${event.headers["x-forwarded-proto"]}://${event.headers["host"]}`
-        : "";
-
-    const csvUrl = `${origin}/inventarios.csv?ts=${Date.now()}`;
-    const res = await fetch(csvUrl, { headers: { "cache-control": "no-store" } });
-    if (!res.ok) {
-      const d = new Date();
-      return json(502, {
-        issueDate: d.toISOString().slice(0, 10),
-        issueTime: d.toTimeString().slice(0, 8),
-        documentID: "C1",
-        documentNumber: "00001",
-        variant: "0",
-        errorHeader: { errorCode: "2" },
-        totalLineItemNumber: "0",
-        contract: { documentID: "00001" },
+    if (!warehouse) {
+      return json(400, {
+        ...buildBaseResponse(),
+        errorCode: { errorCode: 914 },
+        errorHeader: "Missing warehouse",
+        totalLineItemNumber: 0,
         lineLevel: []
       });
     }
 
-    let items = parseCsv(await res.text());
-    if (warehouse) items = items.filter(x => x.warehouse === warehouse);
-    if (mspn) items = items.filter(x => x.mspn === mspn);
+    const items = await fetchInventoryCsv(event);
+    let filtered = items.filter((item) => item.warehouse === warehouse);
+    if (mspn) filtered = filtered.filter((item) => item.mspn === mspn);
 
-    const now = new Date();
-    const issueDate = now.toISOString().slice(0, 10);
-    const issueTime = now.toTimeString().slice(0, 8);
+    if (filtered.length === 0) {
+      return json(404, {
+        ...buildBaseResponse(),
+        errorCode: { errorCode: 0 },
+        errorHeader: null,
+        totalLineItemNumber: 0,
+        lineLevel: []
+      });
+    }
 
-    const lineLevel = items.map((x) => ({
-      lineId: String(x.mspn),
+    const lineLevel = filtered.map((item) => ({
+      lineId: String(item.mspn),
       article: {
         articleIdentification: {
-          manufacturersArticleID: String(x.mspn),
-          eanuccArticleID: String(x.mspn)
+          manufacturersArticleID: String(item.mspn),
+          ...(item.eanucc ? { eanuccArticleID: String(item.eanucc) } : {})
         },
         articleDescription: {
-          articleDescriptionText: (x.description && x.description.length > 0) ? x.description : String(x.mspn)
+          articleDescriptionText: item.description || String(item.mspn)
         },
         scheduleDetails: {
           availableQuantity: {
-            quantityValue: Number(x.available) || 0
+            quantityValue: item.available
           }
         }
       }
     }));
 
-    return json(items.length ? 200 : 404, {
-      issueDate,
-      issueTime,
-      documentID: "C1",
-      documentNumber: "00001",
-      variant: "0",
-      errorHeader: { errorCode: "0" },
-      totalLineItemNumber: String(lineLevel.length),
-      contract: { documentID: "00001" },
+    return json(200, {
+      ...buildBaseResponse(),
+      errorCode: { errorCode: 0 },
+      errorHeader: null,
+      totalLineItemNumber: lineLevel.length,
       lineLevel
     });
-  } catch (err) {
-    const d = new Date();
+  } catch (error) {
+    console.error("whs-inventory error", error);
     return json(500, {
-      issueDate: d.toISOString().slice(0, 10),
-      issueTime: d.toTimeString().slice(0, 8),
-      documentID: "C1",
-      documentNumber: "00001",
-      variant: "0",
-      errorHeader: { errorCode: "1" },
-      totalLineItemNumber: "0",
-      contract: { documentID: "00001" },
+      ...buildBaseResponse(),
+      errorCode: { errorCode: 304 },
+      errorHeader: "Request to ERP - System disconnected",
+      totalLineItemNumber: 0,
       lineLevel: []
     });
   }
